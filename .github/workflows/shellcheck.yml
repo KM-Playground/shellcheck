@@ -167,7 +167,8 @@ jobs:
 
           # Use reviewdog to post inline comments if there are issues (skip if running locally)
           if [[ -s shellcheck_diff_filtered.txt ]]; then
-            cat shellcheck_diff_filtered.txt | reviewdog -f=gcc \
+            cat shellcheck_diff_filtered.txt | reviewdog \
+              -efm="%f:%l:%c: %t%*[^:]: %m [%r]" \
               -name="shellcheck" \
               -reporter=github-pr-review \
               -filter-mode=nofilter \
@@ -177,7 +178,7 @@ jobs:
 
       # Step 9: Report ShellCheck summary
       - name: Report ShellCheck summary
-        if: ${{ steps.extract_shell_info.outputs.has_shell_scripts == 'true' }}
+        if: ${{ always() && steps.extract_shell_info.outputs.has_shell_scripts == 'true' }}
         run: |
           if [[ -f shellcheck_results.txt && -s shellcheck_results.txt ]]; then
             echo "ShellCheck found the following issues:"
@@ -222,7 +223,7 @@ jobs:
 
       # Step 10: Fail build if issues found
       - name: Fail build if ShellCheck issues found
-        if: ${{ steps.extract_shell_info.outputs.has_shell_scripts == 'true' && steps.run_shellcheck.outputs.exit_code == '1' }}
+        if: ${{ always() && steps.extract_shell_info.outputs.has_shell_scripts == 'true' && steps.run_shellcheck.outputs.exit_code == '1' }}
         run: |
           echo "❌ Build failed due to ShellCheck issues"
           echo "Please check the inline comments added by reviewdog on your PR"
