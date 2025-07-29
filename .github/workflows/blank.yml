@@ -1,0 +1,266 @@
+name: Validate Shell Scripts on PR to master/release branch
+
+# This workflow has two jobs:
+# 1. 'evaluation' - Checks if the PR targets EITHER 'master' or 'release' branches
+# 2. 'shell-lint' - Runs ShellCheck linting on modified shell scripts
+#
+# The workflow runs only when:
+# 1. A comment is created on a PR
+# 2. The comment is "/run-ci" or "ok to test"
+# 3. For the shell-lint job, the PR must target EITHER 'master' or 'release' branches
+on:
+  issue_comment:
+    types:
+      - created
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  evaluation:
+    runs-on:
+      ubuntu-latest
+    # We will now run this workflow when the following conditions are met
+    # 1. Someone added a comment on a Pull Request (AND NOT an issue)
+    # 2. The contents of the comment was:
+    #    a. Not empty
+    #    b. "/run-ci" (or)
+    #    c. "ok to test" (ignoring case)
+    if: >
+      github.event.comment.body &&
+      contains(fromJSON('["/run-ci", "ok to test"]'), github.event.comment.body) &&
+      github.event.issue.pull_request != null
+    outputs:
+      should_run: ${{ steps.check_target.outputs.should_run }}
+    steps:
+      - name: Check target branch
+        id: check_target
+        run: |
+          # Get PR number from the event payload
+          PR_NUMBER=${{ github.event.issue.number }}
+
+          # Get PR details using GitHub CLI
+          PR_DETAILS=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER)
+
+          # Extract target branch name
+          TARGET_BRANCH=$(echo "$PR_DETAILS" | jq -r '.base.ref')
+          echo "Target branch: $TARGET_BRANCH"
+
+          # Check if target branch is master or release
+          if [[ "$TARGET_BRANCH" == "master" || "$TARGET_BRANCH" == "release" ]]; then
+            echo "Workflow will run"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "::Notice:: This workflow only runs for PRs targeting 'master' or 'release' branches."
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  shellscript-validation:
+    needs: evaluation
+    if: needs.evaluation.outputs.should_run == 'true' && vars.GHA_ENABLE_SHELL_CHECK == 'true'
+    runs-on:
+      ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      repository-projects: write
+      id-token: write
+      statuses: write
+      checks: write
+
+    steps:
+      # Step 1: Get PR information using GitHub CLI
+      - name: Get PR details
+        id: get-pr
+        run: |
+          pr_number=${{ github.event.issue.number }}
+          gh api repos/${{ github.repository }}/pulls/$pr_number > pr.json
+          cat pr.json
+
+      # Step 2: Extract and log the PR branch name
+      - name: Extract PR branch
+        id: extract-branch
+        run: |
+          branch_name=$(jq -r '.head.ref' pr.json)
+          target_branch_name=$(jq -r '.base.ref' pr.json)
+          echo "PR branch is $branch_name"
+          echo "PR targeted at branch $target_branch_name"
+          echo "branch_name=$branch_name" >> $GITHUB_ENV
+          echo "target_branch_name=$target_branch_name" >> $GITHUB_ENV
+
+      # Step 3: Check out the PR branch
+      # We need to check out the specific PR branch (not the default branch) because:
+      # 1. This workflow is triggered by PR comments, not PR events
+      # 2. By default, GitHub Actions checks out the default branch (master/main)
+      # 3. We need the actual PR code to run shell checks on it.
+      # 4. The branch name was extracted from the PR details in the previous step
+      # 5. This ensures we're testing the exact code that will be merged
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.branch_name }}
+
+      # Step 4: Generate the diff
+      - name: Generate the diff
+        run: |
+          REPO="bidgely/pingpong"
+          pr_number=${{ github.event.issue.number }}
+          # Use the GH CLI to get the diff via an api call
+          # Use `tee` binary to save it to a file called full-changeset.txt
+          # Use `sed` to remove off diff --git a/ from each of the lines (we are streaming the lines)
+          # From the final output which could look like "src/main/java/App.java b/src/main/java/App.java"
+          # get the first field using `cut` command
+
+          # Run gh pr diff and capture output
+          gh pr diff "$pr_number" | tee full-changeset.txt | sed -n 's/^diff --git a\///p' | cut -d' ' -f1 > changeset.txt
+
+          # Check if full-changeset.txt has content
+          if [ -s full-changeset.txt ]; then
+            echo "Successfully retrieved diff using gh pr diff"
+          else
+            # The failure usually happens when the diff is very large and has 300+ files in it
+            # So we need to handle those PRs via the API invocation mechanism.
+            echo "gh pr diff failed, falling back to API method..."
+
+            # Fetch PR file changes and save as JSON
+            gh api "repos/$REPO/pulls/$pr_number/files" --paginate > full-changeset.json
+
+            # Convert JSON response to a git diff-like format
+            jq -r '.[] | "diff --git a/\(.filename) b/\(.filename)\n\(.patch)"' full-changeset.json > full-changeset.txt
+
+            # Extract file names from JSON and store in changeset.txt
+            jq -r '.[].filename' full-changeset.json > changeset.txt
+          fi
+
+          echo "Diff stored in full-changeset.txt"
+          echo "File list stored in changeset.txt"
+
+        # Step 6: Log Workflow run URL on PR
+      - name: Log Workflow run URL on PR
+        if: ${{ env.ACT != 'true' }}
+        run: |
+          gh issue comment ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --body "✅ ShellCheck Job started. : [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+      - name: Install ShellCheck
+        if: ${{ env.ACT != 'true' }}
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Install reviewdog
+        if: ${{ steps.check_db_changes.outputs.run_tests == 'false' }}
+        uses: reviewdog/action-setup@e04ffabe3898a0af8d0fb1af00c188831c4b5893
+        with:
+          reviewdog_version: v0.20.3
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        # Setup python ONLY if we are NOT testing this workflow locally using ACT tool
+        if: env.ACT != 'true'
+        with:
+          python-version: "3.13"
+
+      # Step 7: Extract shell scripts and modified lines
+      - name: Extract shell scripts and modified lines
+        id: extract_shell_info
+        run: |
+          # Run combined Python script to extract shell scripts and their modified lines
+          output=$(python3 .github/scripts/shellcheck/extract_shell_info.py changeset.txt full-changeset.txt)
+          echo "$output"
+
+          # Extract the has_shell_scripts value from the output
+          if echo "$output" | grep -q "has_shell_scripts=true"; then
+            echo "has_shell_scripts=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_shell_scripts=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 8: Run ShellCheck with diff-aware filtering and reviewdog
+      - name: Run ShellCheck with diff-aware filtering
+        if: ${{ steps.extract_shell_info.outputs.has_shell_scripts == 'true' }}
+        id: run_shellcheck
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}
+          CI_PULL_REQUEST: ${{ github.event.issue.number }}
+          CI_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_REPO_OWNER: ${{ github.repository_owner }}
+          CI_REPO_NAME: ${{ github.event.repository.name }}
+          GITHUB_EVENT_NAME: pull_request
+        run: |
+          # Run Python script to execute ShellCheck with filtering
+          output=$(python3 .github/scripts/shellcheck/run_shellcheck.py shell_scripts.txt modified_lines_map.txt)
+          echo "$output"
+
+          # Extract outputs for GitHub Actions
+          total_issues=$(echo "$output" | grep "total_issues=" | cut -d= -f2)
+          exit_code=$(echo "$output" | grep "exit_code=" | cut -d= -f2)
+
+          echo "total_issues=$total_issues" >> $GITHUB_OUTPUT
+          echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
+
+          # Use reviewdog to post inline comments if there are issues (skip if running locally)
+          if [[ -s shellcheck_diff_filtered.txt ]]; then
+            cat shellcheck_diff_filtered.txt | reviewdog -f=gcc \
+              -name="shellcheck" \
+              -reporter=github-pr-review \
+              -filter-mode=nofilter \
+              -fail-on-error=false \
+              -level=error
+          fi
+
+      # Step 9: Report ShellCheck summary
+      - name: Report ShellCheck summary
+        if: ${{ steps.extract_shell_info.outputs.has_shell_scripts == 'true' }}
+        run: |
+          if [[ -f shellcheck_results.txt && -s shellcheck_results.txt ]]; then
+            echo "ShellCheck found the following issues:"
+            echo "=================================="
+            cat shellcheck_results.txt
+            echo "=================================="
+
+            # Post summary comment on PR (reviewdog already added inline comments)
+            {
+              echo "## 🔍 ShellCheck Summary"
+              echo ""
+              echo "ShellCheck found **${{ steps.run_shellcheck.outputs.total_issues }}** issue(s) on **modified lines** in the shell scripts."
+              echo ""
+              echo "📝 **Inline comments have been added to the specific lines with issues.**"
+              echo ""
+              echo "ℹ️ **Note**: Only issues on lines you modified are reported to keep the feedback focused and relevant."
+              echo ""
+              echo "Please fix these issues before merging. The build will fail until all non-trivial ShellCheck issues are resolved."
+              echo ""
+              echo "<details>"
+              echo "<summary>Click to see all issues on modified lines</summary>"
+              echo ""
+              echo '```'
+              echo ""
+              cat shellcheck_results.txt
+              echo ""
+              echo '```'
+              echo "</details>"
+            } > shellcheck_comment.md
+
+            gh issue comment ${{ github.event.issue.number }} \
+              --repo ${{ github.repository }} \
+              --body-file shellcheck_comment.md
+          else
+            echo "✅ No ShellCheck issues found in modified shell scripts"
+
+            # Post success comment
+            gh issue comment ${{ github.event.issue.number }} \
+              --repo ${{ github.repository }} \
+              --body "✅ **ShellCheck passed**: No issues found on modified lines in shell scripts. Inline code review completed successfully!"
+          fi
+
+      # Step 10: Fail build if issues found
+      - name: Fail build if ShellCheck issues found
+        if: ${{ steps.extract_shell_info.outputs.has_shell_scripts == 'true' && steps.run_shellcheck.outputs.exit_code == '1' }}
+        run: |
+          echo "❌ Build failed due to ShellCheck issues"
+          echo "Please check the inline comments added by reviewdog on your PR"
+          echo "Fix the issues reported and push your changes"
+          exit 1
+
+
