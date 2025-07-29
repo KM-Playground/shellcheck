@@ -1,18 +1,17 @@
-name: Validate Shell Scripts on PR to main/release branch
+name: Validate Shell Scripts on Comment Trigger
 
 # This workflow has two jobs:
 # 1. 'evaluation' - Checks if the PR targets EITHER 'main' or 'release' branches
 # 2. 'shell-lint' - Runs ShellCheck linting on modified shell scripts
 #
 # The workflow runs when:
-# 1. A PR is opened, reopened, or synchronized (new commits pushed)
-# 2. For the shell-lint job, the PR must target EITHER 'main' or 'release' branches
+# 1. A comment is created on a PR
+# 2. The comment is "ok to test" (case insensitive)
+# 3. For the shell-lint job, the PR must target EITHER 'main' or 'release' branches
 on:
-  pull_request:
+  issue_comment:
     types:
-      - opened
-      - reopened
-      - synchronize
+      - created
 env:
   GH_TOKEN: ${{ github.token }}
 
@@ -21,16 +20,27 @@ jobs:
     runs-on:
       ubuntu-latest
     # We will now run this workflow when the following conditions are met
-    # 1. A PR is opened, reopened, or synchronized
-    # 2. The PR targets either 'main' or 'release' branches
+    # 1. Someone added a comment on a Pull Request (AND NOT an issue)
+    # 2. The contents of the comment was "ok to test" (ignoring case)
+    # 3. The PR targets either 'main' or 'release' branches
+    if: >
+      github.event.comment.body &&
+      contains(fromJSON('["ok to test", "OK TO TEST", "Ok to test", "Ok To Test"]'), github.event.comment.body) &&
+      github.event.issue.pull_request != null
     outputs:
       should_run: ${{ steps.check_target.outputs.should_run }}
     steps:
       - name: Check target branch
         id: check_target
         run: |
-          # Extract target branch name from PR event
-          TARGET_BRANCH="${{ github.event.pull_request.base.ref }}"
+          # Get PR number from the event payload
+          PR_NUMBER=${{ github.event.issue.number }}
+
+          # Get PR details using GitHub CLI
+          PR_DETAILS=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER)
+
+          # Extract target branch name
+          TARGET_BRANCH=$(echo "$PR_DETAILS" | jq -r '.base.ref')
           echo "Target branch: $TARGET_BRANCH"
 
           # Check if target branch is main or release
@@ -41,6 +51,8 @@ jobs:
             echo "::Notice:: This workflow only runs for PRs targeting 'main' or 'release' branches."
             echo "should_run=false" >> $GITHUB_OUTPUT
           fi
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   shellscript-validation:
     needs: evaluation
@@ -56,26 +68,42 @@ jobs:
       checks: write
 
     steps:
-      # Step 1: Check out the PR branch
-      # For pull_request events, GitHub Actions automatically checks out the PR branch
-      # This ensures we're testing the exact code that will be merged
+      # Step 1: Get PR information using GitHub CLI
+      - name: Get PR details
+        id: get-pr
+        run: |
+          pr_number=${{ github.event.issue.number }}
+          gh api repos/${{ github.repository }}/pulls/$pr_number > pr.json
+          cat pr.json
+
+      # Step 2: Extract and log the PR branch name
+      - name: Extract PR branch
+        id: extract-branch
+        run: |
+          branch_name=$(jq -r '.head.ref' pr.json)
+          target_branch_name=$(jq -r '.base.ref' pr.json)
+          echo "PR branch is $branch_name"
+          echo "PR targeted at branch $target_branch_name"
+          echo "branch_name=$branch_name" >> $GITHUB_ENV
+          echo "target_branch_name=$target_branch_name" >> $GITHUB_ENV
+
+      # Step 3: Check out the PR branch
+      # We need to check out the specific PR branch (not the default branch) because:
+      # 1. This workflow is triggered by PR comments, not PR events
+      # 2. By default, GitHub Actions checks out the default branch (master/main)
+      # 3. We need the actual PR code to run shell checks on it.
+      # 4. The branch name was extracted from the PR details in the previous step
+      # 5. This ensures we're testing the exact code that will be merged
       - name: Check out PR branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.branch_name }}
 
-      # Step 2: Set PR information from event context
-      - name: Set PR information
-        run: |
-          echo "branch_name=${{ github.event.pull_request.head.ref }}" >> $GITHUB_ENV
-          echo "target_branch_name=${{ github.event.pull_request.base.ref }}" >> $GITHUB_ENV
-          echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_ENV
-          echo "PR branch is ${{ github.event.pull_request.head.ref }}"
-          echo "PR targeted at branch ${{ github.event.pull_request.base.ref }}"
-
-      # Step 3: Generate the diff
+      # Step 4: Generate the diff
       - name: Generate the diff
         run: |
           REPO="${{ github.repository }}"
-          pr_number="${{ github.event.pull_request.number }}"
+          pr_number=${{ github.event.issue.number }}
           # Use the GH CLI to get the diff via an api call
           # Use `tee` binary to save it to a file called full-changeset.txt
           # Use `sed` to remove off diff --git a/ from each of the lines (we are streaming the lines)
@@ -106,10 +134,10 @@ jobs:
           echo "Diff stored in full-changeset.txt"
           echo "File list stored in changeset.txt"
 
-        # Step 4: Log Workflow run URL on PR
+        # Step 5: Log Workflow run URL on PR
       - name: Log Workflow run URL on PR
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} \
+          gh issue comment ${{ github.event.issue.number }} \
             --repo ${{ github.repository }} \
             --body "✅ ShellCheck Job started. : [View Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
 
@@ -127,7 +155,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      # Step 7: Extract shell scripts and modified lines
+      # Step 6: Extract shell scripts and modified lines
       - name: Extract shell scripts and modified lines
         id: extract_shell_info
         run: |
@@ -142,13 +170,13 @@ jobs:
             echo "has_shell_scripts=false" >> $GITHUB_OUTPUT
           fi
 
-      # Step 8: Run ShellCheck with diff-aware filtering and reviewdog
+      # Step 7: Run ShellCheck with diff-aware filtering and reviewdog
       - name: Run ShellCheck with diff-aware filtering
         if: ${{ steps.extract_shell_info.outputs.has_shell_scripts == 'true' }}
         id: run_shellcheck
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ github.token }}
-          CI_PULL_REQUEST: ${{ github.event.pull_request.number }}
+          CI_PULL_REQUEST: ${{ github.event.issue.number }}
           CI_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
           CI_REPO_OWNER: ${{ github.repository_owner }}
           CI_REPO_NAME: ${{ github.event.repository.name }}
@@ -176,7 +204,7 @@ jobs:
               -level=error
           fi
 
-      # Step 9: Report ShellCheck summary
+      # Step 8: Report ShellCheck summary
       - name: Report ShellCheck summary
         if: ${{ always() && steps.extract_shell_info.outputs.has_shell_scripts == 'true' }}
         run: |
@@ -209,19 +237,19 @@ jobs:
               echo "</details>"
             } > shellcheck_comment.md
 
-            gh pr comment ${{ github.event.pull_request.number }} \
+            gh issue comment ${{ github.event.issue.number }} \
               --repo ${{ github.repository }} \
               --body-file shellcheck_comment.md
           else
             echo "✅ No ShellCheck issues found in modified shell scripts"
 
             # Post success comment
-            gh pr comment ${{ github.event.pull_request.number }} \
+            gh issue comment ${{ github.event.issue.number }} \
               --repo ${{ github.repository }} \
               --body "✅ **ShellCheck passed**: No issues found on modified lines in shell scripts. Inline code review completed successfully!"
           fi
 
-      # Step 10: Fail build if issues found
+      # Step 9: Fail build if issues found
       - name: Fail build if ShellCheck issues found
         if: ${{ always() && steps.extract_shell_info.outputs.has_shell_scripts == 'true' && steps.run_shellcheck.outputs.exit_code == '1' }}
         run: |
@@ -229,5 +257,3 @@ jobs:
           echo "Please check the inline comments added by reviewdog on your PR"
           echo "Fix the issues reported and push your changes"
           exit 1
-
-
