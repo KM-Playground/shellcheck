@@ -26,13 +26,12 @@ def filter_trivial_issues(shellcheck_output):
     Returns:
         list: Filtered lines without trivial issues
     """
-    # Filter out common syntax errors that are typically trivial:
-    # SC1009: The mentioned syntax error was in this simple command
-    # SC1073: Couldn't parse this simple command
-    # SC1072: Missing space before ]
-    # SC1070: Parsing stopped here. Invalid use of keywords
-    # SC1071: ShellCheck only supports sh/bash/dash/ksh scripts
-    trivial_codes = ['SC1009', 'SC1073', 'SC1072', 'SC1070', 'SC1071']
+    # Filter out only truly trivial issues that don't affect script functionality:
+    # SC1071: ShellCheck only supports sh/bash/dash/ksh scripts (informational)
+    #
+    # NOTE: Removed SC1009, SC1073, SC1072, SC1070 as these are CRITICAL syntax errors
+    # that should fail the build, not be filtered out as trivial
+    trivial_codes = ['SC1071']
     
     filtered_lines = []
     for line in shellcheck_output.split('\n'):
